@@ -1,0 +1,12 @@
+{
+  "name": "claude-code-proxy",
+  "version": "1.0.0",
+  "description": "OpenAI-compatible API proxy for Claude Code CLI",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "bin": {
+    "claude-code-proxy": "./server.js"
+  }
+}
