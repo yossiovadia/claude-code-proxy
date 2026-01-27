@@ -9,6 +9,7 @@ const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'sonnet';
 function formatMessages(messages) {
   // Helper to extract text from content (string or array)
   const getContentText = (content) => {
+    if (content === null || content === undefined) return '';
     if (typeof content === 'string') return content;
     if (Array.isArray(content)) {
       return content
@@ -19,34 +20,58 @@ function formatMessages(messages) {
     return String(content);
   };
 
-  if (messages.length === 1 && messages[0].role === 'user') {
-    return getContentText(messages[0].content);
+  const parts = [];
+
+  for (const m of messages) {
+    if (m.role === 'user') {
+      const text = getContentText(m.content);
+      // Skip Clawdbot's compaction messages - they confuse Claude Code
+      if (text.startsWith('The conversation history before this point was compacted')) {
+        continue;
+      }
+      parts.push(text);
+    } else if (m.role === 'assistant') {
+      const text = getContentText(m.content);
+      if (text) {
+        parts.push(`Assistant: ${text}`);
+      }
+    }
   }
-  return messages.map(m => {
-    const text = getContentText(m.content);
-    if (m.role === 'system') return `[System: ${text}]`;
-    if (m.role === 'assistant') return `Assistant: ${text}`;
-    return text;
-  }).join('\n\n');
+
+  return parts.join('\n\n');
 }
 
 function callClaude(prompt) {
   // Escape single quotes in prompt
   const escaped = prompt.replace(/'/g, "'\\''");
-  const cmd = `claude -p '${escaped}' --output-format text --dangerously-skip-permissions --model ${CLAUDE_MODEL}`;
+  // Enable tools with --tools default, use JSON output to parse result
+  const cmd = `claude -p '${escaped}' --tools default --output-format json --dangerously-skip-permissions --model ${CLAUDE_MODEL}`;
 
   console.log(`[${new Date().toISOString()}] Running: claude -p '${prompt.substring(0, 50)}...'`);
 
   try {
-    const result = execSync(cmd, {
+    const output = execSync(cmd, {
       encoding: 'utf8',
-      timeout: 120000, // 2 min timeout (reduce if rate-limited)
+      timeout: 300000, // 5 min timeout for tool use
       maxBuffer: 10 * 1024 * 1024 // 10MB
     });
-    return result.trim();
+
+    // Parse JSON output and extract result
+    try {
+      const json = JSON.parse(output.trim());
+      if (json.result) {
+        console.log(`[${new Date().toISOString()}] Turns: ${json.num_turns}, Cost: $${json.total_cost_usd?.toFixed(4) || '0'}`);
+        return json.result;
+      }
+      // Fallback if no result field
+      return json.error || output.trim();
+    } catch (parseErr) {
+      // If not JSON, return raw output
+      return output.trim();
+    }
   } catch (err) {
     if (err.killed) {
-      throw new Error('Claude timed out after 2 minutes - possible rate limiting');
+      throw new Error('Claude timed out after 5 minutes');
     }
     throw new Error(`Claude failed: ${err.message.substring(0, 200)}`);
   }
@@ -67,6 +92,7 @@ async function handleChatCompletions(req, res) {
   }
 
   const { messages, stream } = data;
+  // Ignore tools and tool_choice - Claude Code has its own tools
 
   if (!messages || !Array.isArray(messages)) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -74,8 +100,11 @@ async function handleChatCompletions(req, res) {
     return;
   }
 
-  const prompt = formatMessages(messages);
-  console.log(`[${new Date().toISOString()}] Request: ${prompt.substring(0, 100)}...`);
+  // Filter to only user/assistant messages, skip system and tool messages
+  const cleanMessages = messages.filter(m => m.role === 'user' || m.role === 'assistant');
+
+  const prompt = formatMessages(cleanMessages);
+  console.log(`[${new Date().toISOString()}] Request: ${prompt.substring(0, 150)}...`);
 
   try {
     const response = callClaude(prompt);
