@@ -130,30 +130,49 @@ function extractSkills(messages) {
 function findMentionedSkill(userMessage, skills) {
   const lower = userMessage.toLowerCase();
 
-  // First, look for explicit "use X skill" or "X skill" patterns
-  // This regex captures the skill name before "skill"
+  // Build list of skill name variants for matching
+  const skillVariantsMap = new Map();
+  for (const skill of skills) {
+    const variants = [
+      skill.name.toLowerCase(),
+      skill.name.replace(/-/g, '').toLowerCase(),
+      skill.name.replace('claude-code-', '').toLowerCase(),
+      skill.name.replace(/-/g, ' ').toLowerCase()
+    ];
+    for (const v of variants) {
+      skillVariantsMap.set(v, skill);
+    }
+  }
+
+  // Pattern 1: "use X skill" or "X skill to"
   const useSkillMatch = lower.match(/use\s+(\w+(?:-\w+)*)\s+skill/i) ||
                         lower.match(/(\w+(?:-\w+)*)\s+skill\s+to/i);
 
   if (useSkillMatch) {
     const requestedSkill = useSkillMatch[1].toLowerCase();
-    console.log(`[${new Date().toISOString()}] Looking for skill: "${requestedSkill}"`);
+    console.log(`[${new Date().toISOString()}] Looking for skill (pattern 1): "${requestedSkill}"`);
 
-    for (const skill of skills) {
-      const nameVariants = [
-        skill.name.toLowerCase(),
-        skill.name.replace(/-/g, '').toLowerCase(),
-        skill.name.replace('claude-code-', '').toLowerCase(),
-        skill.name.replace(/-/g, ' ').toLowerCase()
-      ];
+    for (const [variant, skill] of skillVariantsMap) {
+      if (variant === requestedSkill ||
+          variant.startsWith(requestedSkill) ||
+          requestedSkill.startsWith(variant.substring(0, 4))) {
+        return skill;
+      }
+    }
+  }
 
-      for (const variant of nameVariants) {
-        // Check for exact match or close match (handles typos like "wingmand")
-        if (variant === requestedSkill ||
-            variant.startsWith(requestedSkill) ||
-            requestedSkill.startsWith(variant.substring(0, 4))) {
-          return skill;
-        }
+  // Pattern 2: "use [known-skill-name] to" without the word "skill"
+  // Check if any known skill name appears after "use" and before "to"
+  const useToMatch = lower.match(/use\s+(\w+(?:-\w+)*)\s+to\b/i);
+  if (useToMatch) {
+    const potentialSkill = useToMatch[1].toLowerCase();
+    console.log(`[${new Date().toISOString()}] Looking for skill (pattern 2): "${potentialSkill}"`);
+
+    for (const [variant, skill] of skillVariantsMap) {
+      if (variant === potentialSkill ||
+          variant.startsWith(potentialSkill) ||
+          potentialSkill.startsWith(variant.substring(0, 4))) {
+        return skill;
       }
     }
   }
@@ -189,6 +208,40 @@ function readSkillFile(location) {
   }
 }
 
+// Detect if a message is a follow-up that needs context from previous messages
+function isFollowUpMessage(text) {
+  const lower = text.toLowerCase().trim();
+
+  // Pronouns/references that suggest follow-up
+  const followUpPatterns = [
+    /^(it|this|that|these|those|the)\b/,  // Starts with reference
+    /\b(it|this|that)\s+(is|was|does|did|has|had|should|would|could|can|will)\b/,  // "it is", "that was"
+    /\b(same|previous|last|earlier|above|mentioned)\b/,  // Explicit references
+    /^(and|but|also|so|now|then|ok|okay|yes|no|yeah|yep|nope)\b/,  // Continuation words
+    /^(why|how|what|where|when)\s+(is|was|does|did|about)\s+(it|this|that)\b/,  // "why is it", "what about that"
+    /\?$/,  // Questions are often follow-ups (but not always)
+  ];
+
+  // Check for follow-up patterns
+  for (const pattern of followUpPatterns) {
+    if (pattern.test(lower)) {
+      // Exception: standalone questions that are complete on their own
+      if (lower.endsWith('?') && lower.length > 50) {
+        // Long questions are usually self-contained
+        continue;
+      }
+      return true;
+    }
+  }
+
+  // Very short messages often need context
+  if (lower.length < 20 && !lower.includes('hello') && !lower.includes('hi ')) {
+    return true;
+  }
+
+  return false;
+}
+
 function formatMessages(messages, useExecutorPrefix = false) {
   // Helper to extract text from content (string or array)
   const getContentText = (content) => {
@@ -212,29 +265,35 @@ function formatMessages(messages, useExecutorPrefix = false) {
       if (text.startsWith('The conversation history before this point was compacted')) {
         continue;
       }
-      // Strip timestamp prefix from ClawdBot messages [WhatsApp +xxx ...]
-      const cleanText = text.replace(/^\[WhatsApp[^\]]+\]\s*/i, '').trim();
+      // Strip platform prefixes from ClawdBot messages
+      const cleanText = text
+        .replace(/^\[WhatsApp[^\]]+\]\s*/i, '')
+        .replace(/^\[Telegram[^\]]+\]\s*/i, '')
+        .replace(/\[message_id:[^\]]+\]\s*/gi, '')
+        .trim();
       if (cleanText) {
         userMessages.push(cleanText);
       }
     }
   }
 
-  // Use the last few user messages for context, but prioritize the most recent
-  const recentMessages = userMessages.slice(-3);
-  if (recentMessages.length === 0) {
+  if (userMessages.length === 0) {
     return '';
   }
 
-  // If there are multiple messages, provide brief context
-  if (recentMessages.length > 1) {
-    const context = recentMessages.slice(0, -1).join(' | ');
-    const task = recentMessages[recentMessages.length - 1];
-    const prefix = useExecutorPrefix ? EXECUTOR_PREFIX : '';
-    return prefix + `Context from earlier: ${context}\n\nCurrent task: ${task}`;
+  const currentMessage = userMessages[userMessages.length - 1];
+  const prefix = useExecutorPrefix ? EXECUTOR_PREFIX : '';
+
+  // Only include context if the current message appears to be a follow-up
+  if (userMessages.length > 1 && isFollowUpMessage(currentMessage)) {
+    // Include minimal context - just the immediately previous message
+    const prevMessage = userMessages[userMessages.length - 2];
+    console.log(`[${new Date().toISOString()}] Follow-up detected, including context`);
+    return prefix + `Previous: ${prevMessage.substring(0, 200)}\n\nCurrent: ${currentMessage}`;
   }
 
-  return useExecutorPrefix ? EXECUTOR_PREFIX + recentMessages[0] : recentMessages[0];
+  // Standalone message - no context needed
+  return prefix + currentMessage;
 }
 
 function callClaude(prompt, options = {}) {
