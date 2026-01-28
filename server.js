@@ -10,6 +10,98 @@ const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'sonnet';
 // Minimal executor prefix - keeps responses action-oriented
 const EXECUTOR_PREFIX = 'Execute this task and report what you did: ';
 
+// Extract workspace directory from ClawdBot's system message
+function extractWorkspace(messages) {
+  const systemMsg = messages.find(m => m.role === 'system');
+  if (!systemMsg) return null;
+
+  const content = typeof systemMsg.content === 'string'
+    ? systemMsg.content
+    : systemMsg.content?.map(p => p.text).join('\n') || '';
+
+  // Look for "Your working directory is: /path"
+  const workdirMatch = content.match(/Your working directory is:\s*(\S+)/);
+  if (workdirMatch) {
+    return workdirMatch[1].replace(/^~/, process.env.HOME);
+  }
+
+  return null;
+}
+
+// Extract persona (SOUL.md, IDENTITY.md) from ClawdBot's system message
+function extractPersona(messages) {
+  const systemMsg = messages.find(m => m.role === 'system');
+  if (!systemMsg) return null;
+
+  const content = typeof systemMsg.content === 'string'
+    ? systemMsg.content
+    : systemMsg.content?.map(p => p.text).join('\n') || '';
+
+  // Extract key persona sections
+  const sections = [];
+
+  // IDENTITY.md
+  const identityMatch = content.match(/## IDENTITY\.md\n([\s\S]*?)(?=\n## [A-Z]|\n# |$)/);
+  if (identityMatch) sections.push(identityMatch[1].trim());
+
+  // SOUL.md (abbreviated - just core truths)
+  const soulMatch = content.match(/## SOUL\.md\n([\s\S]*?)(?=\n## [A-Z]|\n# |$)/);
+  if (soulMatch) {
+    // Extract just the first few paragraphs to keep it brief
+    const soulContent = soulMatch[1].trim().split('\n\n').slice(0, 3).join('\n\n');
+    sections.push(soulContent);
+  }
+
+  return sections.length > 0 ? sections.join('\n\n') : null;
+}
+
+// Detect if request is conversational vs coding task
+function isConversationalRequest(text) {
+  // Strip platform prefixes first (WhatsApp, Telegram, etc.)
+  let cleaned = text
+    .replace(/^\[WhatsApp[^\]]+\]\s*/i, '')
+    .replace(/^\[Telegram[^\]]+\]\s*/i, '')
+    .replace(/^\[Discord[^\]]+\]\s*/i, '')
+    .replace(/^\[Slack[^\]]+\]\s*/i, '')
+    .replace(/^\[Signal[^\]]+\]\s*/i, '')
+    .replace(/\[message_id:[^\]]+\]\s*/gi, '')
+    .trim();
+
+  const lower = cleaned.toLowerCase().trim();
+
+  // Coding indicators
+  const codingPatterns = [
+    /\b(fix|implement|create|write|edit|refactor|debug|test|deploy|build|run|execute|compile|install)\b/,
+    /\b(function|class|method|variable|file|code|script|program|api|endpoint|database|server)\b/,
+    /\b(bug|error|issue|pr|pull request|commit|branch|merge|git)\b/,
+    /\buse\s+\w+\s+skill\b/,
+  ];
+
+  for (const pattern of codingPatterns) {
+    if (pattern.test(lower)) return false;
+  }
+
+  // Conversational indicators
+  const conversationalPatterns = [
+    /^(hi|hello|hey|what's up|how are you)/,
+    /^(what is|what are|what's|who is|who are|where is|why|how does|can you explain)/,
+    /\?$/,  // Questions
+    /^(tell me|explain|describe|summarize)/,
+    /^(thanks|thank you|ok|okay|great|cool|nice)/,
+  ];
+
+  for (const pattern of conversationalPatterns) {
+    if (pattern.test(lower)) return true;
+  }
+
+  // Short messages are often conversational
+  if (lower.length < 50 && !lower.includes('file') && !lower.includes('code')) {
+    return true;
+  }
+
+  return false;
+}
+
 // Extract available skills from ClawdBot's system message
 function extractSkills(messages) {
   const systemMsg = messages.find(m => m.role === 'system');
@@ -145,16 +237,26 @@ function formatMessages(messages, useExecutorPrefix = false) {
   return useExecutorPrefix ? EXECUTOR_PREFIX + recentMessages[0] : recentMessages[0];
 }
 
-function callClaude(prompt) {
+function callClaude(prompt, options = {}) {
+  const { workspace, useTools = true } = options;
+
   // Escape single quotes in prompt
   const escaped = prompt.replace(/'/g, "'\\''");
-  // Enable tools with --tools default, use JSON output to parse result
-  const cmd = `claude -p '${escaped}' --tools default --output-format json --dangerously-skip-permissions --model ${CLAUDE_MODEL}`;
 
+  // Build command - disable tools for conversational requests
+  const toolsFlag = useTools ? '--tools default' : '';
+  const cmd = `claude -p '${escaped}' ${toolsFlag} --output-format json --dangerously-skip-permissions --model ${CLAUDE_MODEL}`;
+
+  // Determine working directory
+  const cwd = workspace || process.env.HOME;
+
+  console.log(`[${new Date().toISOString()}] Running from: ${cwd}`);
+  console.log(`[${new Date().toISOString()}] Tools: ${useTools ? 'enabled' : 'disabled'}`);
   console.log(`[${new Date().toISOString()}] Running: claude -p '${prompt.substring(0, 50)}...'`);
 
   try {
     const output = execSync(cmd, {
+      cwd,
       encoding: 'utf8',
       timeout: 300000, // 5 min timeout for tool use
       maxBuffer: 10 * 1024 * 1024 // 10MB
@@ -206,16 +308,21 @@ async function handleChatCompletions(req, res) {
     return;
   }
 
-  // Extract ClawdBot skills from system message
+  // Extract context from ClawdBot's system message
   const skills = extractSkills(messages);
+  const workspace = extractWorkspace(messages);
+  const persona = extractPersona(messages);
+
   console.log(`[${new Date().toISOString()}] Found ${skills.length} ClawdBot skills`);
+  console.log(`[${new Date().toISOString()}] Workspace: ${workspace || 'not specified'}`);
+  console.log(`[${new Date().toISOString()}] Persona: ${persona ? 'extracted' : 'not found'}`);
 
   // Filter to only user/assistant messages, skip system and tool messages
   const cleanMessages = messages.filter(m => m.role === 'user' || m.role === 'assistant');
 
   // Only use executor prefix when client expects tool usage
   const hasTools = tools && tools.length > 0;
-  let prompt = formatMessages(cleanMessages, hasTools);
+  let prompt = formatMessages(cleanMessages, false); // Don't use executor prefix by default
 
   // Check if user is asking to use a ClawdBot skill
   const lastUserMsg = cleanMessages.filter(m => m.role === 'user').pop();
@@ -234,11 +341,15 @@ async function handleChatCompletions(req, res) {
   console.log(`[${new Date().toISOString()}] Last user text: ${lastUserText.substring(0, 100)}...`);
   const mentionedSkill = findMentionedSkill(lastUserText, skills);
 
+  // Determine request type and build appropriate prompt
+  const isConversational = isConversationalRequest(lastUserText);
+  let useTools = true;
+
   if (mentionedSkill) {
+    // Skill request - inject skill instructions
     console.log(`[${new Date().toISOString()}] Skill detected: ${mentionedSkill.name} at ${mentionedSkill.location}`);
     const skillContent = readSkillFile(mentionedSkill.location);
     if (skillContent) {
-      // Inject skill instructions into prompt
       prompt = `You are helping with a ClawdBot skill called "${mentionedSkill.name}".
 
 Here are the skill instructions (SKILL.md):
@@ -251,12 +362,28 @@ User request: ${prompt}
 Follow the skill instructions above to complete this task. Use bash commands as specified in the skill.`;
       console.log(`[${new Date().toISOString()}] Injected skill content (${skillContent.length} chars)`);
     }
+  } else if (isConversational && persona) {
+    // Conversational request - inject persona, disable tools
+    console.log(`[${new Date().toISOString()}] Conversational request detected, injecting persona`);
+    useTools = false;
+    prompt = `${persona}
+
+---
+
+Respond naturally and conversationally. You are NOT in coding mode - just be helpful and friendly.
+
+User: ${prompt}`;
+  } else if (!isConversational) {
+    // Coding request without specific skill - use executor prefix
+    console.log(`[${new Date().toISOString()}] Coding request detected`);
+    prompt = EXECUTOR_PREFIX + prompt;
   }
 
+  console.log(`[${new Date().toISOString()}] Mode: ${mentionedSkill ? 'skill' : isConversational ? 'conversational' : 'coding'}`);
   console.log(`[${new Date().toISOString()}] Request: ${prompt.substring(0, 150)}...`);
 
   try {
-    const response = callClaude(prompt);
+    const response = callClaude(prompt, { workspace, useTools });
 
     if (stream) {
       res.writeHead(200, {
