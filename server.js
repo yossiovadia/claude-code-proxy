@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const http = require('http');
+const fs = require('fs');
 const { execSync } = require('child_process');
 
 const PORT = process.env.PORT || 11480;
@@ -9,7 +10,94 @@ const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'sonnet';
 // Minimal executor prefix - keeps responses action-oriented
 const EXECUTOR_PREFIX = 'Execute this task and report what you did: ';
 
-function formatMessages(messages) {
+// Extract available skills from ClawdBot's system message
+function extractSkills(messages) {
+  const systemMsg = messages.find(m => m.role === 'system');
+  if (!systemMsg) return [];
+
+  const content = typeof systemMsg.content === 'string'
+    ? systemMsg.content
+    : systemMsg.content?.map(p => p.text).join('\n') || '';
+
+  const skills = [];
+  const skillRegex = /<skill>\s*<name>([^<]+)<\/name>\s*<description>([^<]+)<\/description>\s*<location>([^<]+)<\/location>\s*<\/skill>/g;
+
+  let match;
+  while ((match = skillRegex.exec(content)) !== null) {
+    skills.push({
+      name: match[1].trim(),
+      description: match[2].trim(),
+      location: match[3].trim()
+    });
+  }
+
+  return skills;
+}
+
+// Check if user message mentions a skill and return the skill info
+function findMentionedSkill(userMessage, skills) {
+  const lower = userMessage.toLowerCase();
+
+  // First, look for explicit "use X skill" or "X skill" patterns
+  // This regex captures the skill name before "skill"
+  const useSkillMatch = lower.match(/use\s+(\w+(?:-\w+)*)\s+skill/i) ||
+                        lower.match(/(\w+(?:-\w+)*)\s+skill\s+to/i);
+
+  if (useSkillMatch) {
+    const requestedSkill = useSkillMatch[1].toLowerCase();
+    console.log(`[${new Date().toISOString()}] Looking for skill: "${requestedSkill}"`);
+
+    for (const skill of skills) {
+      const nameVariants = [
+        skill.name.toLowerCase(),
+        skill.name.replace(/-/g, '').toLowerCase(),
+        skill.name.replace('claude-code-', '').toLowerCase(),
+        skill.name.replace(/-/g, ' ').toLowerCase()
+      ];
+
+      for (const variant of nameVariants) {
+        // Check for exact match or close match (handles typos like "wingmand")
+        if (variant === requestedSkill ||
+            variant.startsWith(requestedSkill) ||
+            requestedSkill.startsWith(variant.substring(0, 4))) {
+          return skill;
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+// Read a skill's SKILL.md file and expand path variables
+function readSkillFile(location) {
+  try {
+    // Handle ~ in path
+    const expandedPath = location.replace(/^~/, process.env.HOME);
+    let content = fs.readFileSync(expandedPath, 'utf8');
+
+    // Derive SKILL_ROOT from the file path
+    // If path is /path/to/skill/clawdbot-skill/SKILL.md, root is /path/to/skill
+    let skillRoot = expandedPath;
+    if (skillRoot.endsWith('/SKILL.md')) {
+      skillRoot = skillRoot.slice(0, -'/SKILL.md'.length);
+    }
+    if (skillRoot.endsWith('/clawdbot-skill')) {
+      skillRoot = skillRoot.slice(0, -'/clawdbot-skill'.length);
+    }
+
+    // Replace <SKILL_ROOT> placeholder with actual path
+    content = content.replace(/<SKILL_ROOT>/g, skillRoot);
+    console.log(`[${new Date().toISOString()}] SKILL_ROOT resolved to: ${skillRoot}`);
+
+    return content;
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Failed to read skill file: ${location}`, err.message);
+    return null;
+  }
+}
+
+function formatMessages(messages, useExecutorPrefix = false) {
   // Helper to extract text from content (string or array)
   const getContentText = (content) => {
     if (content === null || content === undefined) return '';
@@ -50,10 +138,11 @@ function formatMessages(messages) {
   if (recentMessages.length > 1) {
     const context = recentMessages.slice(0, -1).join(' | ');
     const task = recentMessages[recentMessages.length - 1];
-    return EXECUTOR_PREFIX + `Context from earlier: ${context}\n\nCurrent task: ${task}`;
+    const prefix = useExecutorPrefix ? EXECUTOR_PREFIX : '';
+    return prefix + `Context from earlier: ${context}\n\nCurrent task: ${task}`;
   }
 
-  return EXECUTOR_PREFIX + recentMessages[0];
+  return useExecutorPrefix ? EXECUTOR_PREFIX + recentMessages[0] : recentMessages[0];
 }
 
 function callClaude(prompt) {
@@ -106,8 +195,10 @@ async function handleChatCompletions(req, res) {
     return;
   }
 
-  const { messages, stream } = data;
-  // Ignore tools and tool_choice - Claude Code has its own tools
+  const { messages, stream, tools, tool_choice } = data;
+  // Log full request for debugging
+  fs.writeFileSync('last-request.json', JSON.stringify(data, null, 2));
+  console.log(`[${new Date().toISOString()}] Tools present: ${tools?.length || 0}, tool_choice: ${JSON.stringify(tool_choice)}`)
 
   if (!messages || !Array.isArray(messages)) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -115,10 +206,53 @@ async function handleChatCompletions(req, res) {
     return;
   }
 
+  // Extract ClawdBot skills from system message
+  const skills = extractSkills(messages);
+  console.log(`[${new Date().toISOString()}] Found ${skills.length} ClawdBot skills`);
+
   // Filter to only user/assistant messages, skip system and tool messages
   const cleanMessages = messages.filter(m => m.role === 'user' || m.role === 'assistant');
 
-  const prompt = formatMessages(cleanMessages);
+  // Only use executor prefix when client expects tool usage
+  const hasTools = tools && tools.length > 0;
+  let prompt = formatMessages(cleanMessages, hasTools);
+
+  // Check if user is asking to use a ClawdBot skill
+  const lastUserMsg = cleanMessages.filter(m => m.role === 'user').pop();
+  // Extract text from content (handle both string and array formats)
+  let lastUserText = '';
+  if (lastUserMsg?.content) {
+    if (typeof lastUserMsg.content === 'string') {
+      lastUserText = lastUserMsg.content;
+    } else if (Array.isArray(lastUserMsg.content)) {
+      lastUserText = lastUserMsg.content
+        .filter(p => p.type === 'text')
+        .map(p => p.text)
+        .join('\n');
+    }
+  }
+  console.log(`[${new Date().toISOString()}] Last user text: ${lastUserText.substring(0, 100)}...`);
+  const mentionedSkill = findMentionedSkill(lastUserText, skills);
+
+  if (mentionedSkill) {
+    console.log(`[${new Date().toISOString()}] Skill detected: ${mentionedSkill.name} at ${mentionedSkill.location}`);
+    const skillContent = readSkillFile(mentionedSkill.location);
+    if (skillContent) {
+      // Inject skill instructions into prompt
+      prompt = `You are helping with a ClawdBot skill called "${mentionedSkill.name}".
+
+Here are the skill instructions (SKILL.md):
+---
+${skillContent}
+---
+
+User request: ${prompt}
+
+Follow the skill instructions above to complete this task. Use bash commands as specified in the skill.`;
+      console.log(`[${new Date().toISOString()}] Injected skill content (${skillContent.length} chars)`);
+    }
+  }
+
   console.log(`[${new Date().toISOString()}] Request: ${prompt.substring(0, 150)}...`);
 
   try {
