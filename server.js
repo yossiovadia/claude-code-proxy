@@ -208,92 +208,86 @@ function readSkillFile(location) {
   }
 }
 
-// Detect if a message is a follow-up that needs context from previous messages
-function isFollowUpMessage(text) {
-  const lower = text.toLowerCase().trim();
-
-  // Pronouns/references that suggest follow-up
-  const followUpPatterns = [
-    /^(it|this|that|these|those|the)\b/,  // Starts with reference
-    /\b(it|this|that)\s+(is|was|does|did|has|had|should|would|could|can|will)\b/,  // "it is", "that was"
-    /\b(same|previous|last|earlier|above|mentioned)\b/,  // Explicit references
-    /^(and|but|also|so|now|then|ok|okay|yes|no|yeah|yep|nope)\b/,  // Continuation words
-    /^(why|how|what|where|when)\s+(is|was|does|did|about)\s+(it|this|that)\b/,  // "why is it", "what about that"
-    /\?$/,  // Questions are often follow-ups (but not always)
-  ];
-
-  // Check for follow-up patterns
-  for (const pattern of followUpPatterns) {
-    if (pattern.test(lower)) {
-      // Exception: standalone questions that are complete on their own
-      if (lower.endsWith('?') && lower.length > 50) {
-        // Long questions are usually self-contained
-        continue;
-      }
-      return true;
-    }
+// Helper to extract text from content (string or array)
+function getContentText(content) {
+  if (content === null || content === undefined) return '';
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter(part => part.type === 'text')
+      .map(part => part.text)
+      .join('\n');
   }
+  return String(content);
+}
 
-  // Very short messages often need context
-  if (lower.length < 20 && !lower.includes('hello') && !lower.includes('hi ')) {
-    return true;
-  }
-
-  return false;
+// Strip platform prefixes from messages
+function stripPlatformPrefix(text) {
+  return text
+    .replace(/^\[WhatsApp[^\]]+\]\s*/i, '')
+    .replace(/^\[Telegram[^\]]+\]\s*/i, '')
+    .replace(/^\[Discord[^\]]+\]\s*/i, '')
+    .replace(/^\[Slack[^\]]+\]\s*/i, '')
+    .replace(/\[message_id:[^\]]+\]\s*/gi, '')
+    .trim();
 }
 
 function formatMessages(messages, useExecutorPrefix = false) {
-  // Helper to extract text from content (string or array)
-  const getContentText = (content) => {
-    if (content === null || content === undefined) return '';
-    if (typeof content === 'string') return content;
-    if (Array.isArray(content)) {
-      return content
-        .filter(part => part.type === 'text')
-        .map(part => part.text)
-        .join('\n');
-    }
-    return String(content);
-  };
-
-  // Get just the user messages to understand the task
-  const userMessages = [];
+  // Build conversation history (last few exchanges)
+  const exchanges = [];
   for (const m of messages) {
-    if (m.role === 'user') {
+    if (m.role === 'user' || m.role === 'assistant') {
       const text = getContentText(m.content);
-      // Skip Clawdbot's compaction messages
+      // Skip compaction messages
       if (text.startsWith('The conversation history before this point was compacted')) {
         continue;
       }
-      // Strip platform prefixes from ClawdBot messages
-      const cleanText = text
-        .replace(/^\[WhatsApp[^\]]+\]\s*/i, '')
-        .replace(/^\[Telegram[^\]]+\]\s*/i, '')
-        .replace(/\[message_id:[^\]]+\]\s*/gi, '')
-        .trim();
+      const cleanText = m.role === 'user' ? stripPlatformPrefix(text) : text;
       if (cleanText) {
-        userMessages.push(cleanText);
+        exchanges.push({ role: m.role, text: cleanText });
       }
     }
   }
 
-  if (userMessages.length === 0) {
+  if (exchanges.length === 0) {
     return '';
   }
 
-  const currentMessage = userMessages[userMessages.length - 1];
+  // Get the current question (last user message)
+  const lastUserIdx = exchanges.map(e => e.role).lastIndexOf('user');
+  if (lastUserIdx === -1) return '';
+
+  const currentQuestion = exchanges[lastUserIdx].text;
   const prefix = useExecutorPrefix ? EXECUTOR_PREFIX : '';
 
-  // Only include context if the current message appears to be a follow-up
-  if (userMessages.length > 1 && isFollowUpMessage(currentMessage)) {
-    // Include minimal context - just the immediately previous message
-    const prevMessage = userMessages[userMessages.length - 2];
-    console.log(`[${new Date().toISOString()}] Follow-up detected, including context`);
-    return prefix + `Previous: ${prevMessage.substring(0, 200)}\n\nCurrent: ${currentMessage}`;
+  // If only one message, just return it
+  if (exchanges.length <= 1) {
+    return prefix + currentQuestion;
   }
 
-  // Standalone message - no context needed
-  return prefix + currentMessage;
+  // Build context from previous exchanges (limit to last 3 exchanges before current)
+  const contextExchanges = exchanges.slice(Math.max(0, lastUserIdx - 4), lastUserIdx);
+
+  if (contextExchanges.length === 0) {
+    return prefix + currentQuestion;
+  }
+
+  // Format context concisely
+  const contextLines = contextExchanges.map(e => {
+    const label = e.role === 'user' ? 'User' : 'Assistant';
+    // Truncate long messages in context
+    const text = e.text.length > 300 ? e.text.substring(0, 300) + '...' : e.text;
+    return `${label}: ${text}`;
+  });
+
+  console.log(`[${new Date().toISOString()}] Including ${contextExchanges.length} context exchanges`);
+
+  // Frame context so Claude knows to use it only if relevant
+  return `${prefix}[Recent conversation for context - use only if relevant to the current question]
+${contextLines.join('\n')}
+
+[Current question - answer this directly]
+${currentQuestion}`;
 }
 
 function callClaude(prompt, options = {}) {
