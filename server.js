@@ -549,8 +549,14 @@ async function handleChatCompletions(req, res) {
 
 ---
 
-This is a NOTIFICATION from the orchestrator system. DO NOT take any action or approve anything.
-Just inform the user about this notification in a friendly way. Let them know they need to respond if action is required.
+This is a NOTIFICATION from the orchestrator system. DO NOT take any action or approve anything yourself.
+
+IMPORTANT: Tell the user EXACTLY what is being requested. Include:
+- The session name
+- The SPECIFIC command or action (e.g., the exact URL, file path, or bash command)
+- Copy the exact details from the notification - don't summarize vaguely like "some content"
+
+Then tell them their options (approve/always/deny + session name).
 
 Notification:
 ${lastUserText}`;
