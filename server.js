@@ -68,6 +68,94 @@ function isOrchestratorNotification(text) {
   return false;
 }
 
+// Parse approval command from user message
+// Returns { action: 'approve'|'always'|'deny', session: string } or null
+function parseApprovalCommand(text, conversationContext) {
+  const cleaned = text
+    .replace(/^\[WhatsApp[^\]]+\]\s*/i, '')
+    .replace(/^\[Telegram[^\]]+\]\s*/i, '')
+    .replace(/\[message_id:[^\]]+\]\s*/gi, '')
+    .trim()
+    .toLowerCase();
+
+  // Direct commands: "approve vsr-fresh", "always vsr-fresh", "deny vsr-fresh"
+  const directMatch = cleaned.match(/^(approve|always|deny)\s+([a-z0-9_-]+)\s*$/i);
+  if (directMatch) {
+    return { action: directMatch[1], session: directMatch[2] };
+  }
+
+  // Short approvals: "approve", "approved", "yes", "sure", "ok", "1"
+  // Need to find session from context (recent notification)
+  const shortApprovalPatterns = [
+    /^(approve|approved|yes|yeah|yep|sure|ok|okay|1|go ahead|do it|allow)\.?$/i,
+    /^(approve|approved)\.?$/i,
+  ];
+
+  for (const pattern of shortApprovalPatterns) {
+    if (pattern.test(cleaned)) {
+      // Look for session in conversation context
+      const session = findSessionInContext(conversationContext);
+      if (session) {
+        return { action: 'approve', session };
+      }
+    }
+  }
+
+  // "always" short form
+  if (/^(always|always allow|trust it)\.?$/i.test(cleaned)) {
+    const session = findSessionInContext(conversationContext);
+    if (session) {
+      return { action: 'always', session };
+    }
+  }
+
+  // "deny" short form
+  if (/^(deny|no|nope|reject|block)\.?$/i.test(cleaned)) {
+    const session = findSessionInContext(conversationContext);
+    if (session) {
+      return { action: 'deny', session };
+    }
+  }
+
+  return null;
+}
+
+// Find session name from recent conversation (notifications mention sessions)
+function findSessionInContext(messages) {
+  // Look backwards through messages for session mentions
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    const content = typeof msg.content === 'string'
+      ? msg.content
+      : msg.content?.map(p => p.text).join('\n') || '';
+
+    // Pattern: "Session 'xxx' needs approval" or "approve xxx"
+    const sessionMatch = content.match(/Session ['"]?([a-z0-9_-]+)['"]?\s+needs approval/i) ||
+                         content.match(/approve\s+([a-z0-9_-]+)/i) ||
+                         content.match(/session[:\s]+([a-z0-9_-]+)/i);
+    if (sessionMatch) {
+      return sessionMatch[1];
+    }
+  }
+  return null;
+}
+
+// Execute approval command
+function executeApproval(action, session) {
+  const scriptPath = `${process.env.HOME}/code/claude-code-wingman/lib/handle-approval.sh`;
+  try {
+    const result = execSync(`${scriptPath} ${action} ${session}`, {
+      encoding: 'utf8',
+      timeout: 10000
+    });
+    console.log(`[${new Date().toISOString()}] Approval executed: ${action} ${session}`);
+    return result.trim() || `✓ Session '${session}' ${action === 'approve' ? 'approved (once)' : action === 'always' ? 'approved (always)' : 'denied'}`;
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Approval failed:`, err.message);
+    return `Failed to ${action} session '${session}': ${err.message}`;
+  }
+}
+
 // Detect if request is conversational vs coding task
 function isConversationalRequest(text) {
   // Strip platform prefixes first (WhatsApp, Telegram, etc.)
@@ -405,6 +493,47 @@ async function handleChatCompletions(req, res) {
     }
   }
   console.log(`[${new Date().toISOString()}] Last user text: ${lastUserText.substring(0, 100)}...`);
+
+  // Check for approval commands first - these bypass Claude entirely
+  const approvalCmd = parseApprovalCommand(lastUserText, messages);
+  if (approvalCmd) {
+    console.log(`[${new Date().toISOString()}] Approval command detected: ${approvalCmd.action} ${approvalCmd.session}`);
+    const result = executeApproval(approvalCmd.action, approvalCmd.session);
+
+    // Return result directly without calling Claude
+    const response = result;
+    if (stream) {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive'
+      });
+      const chunk = {
+        id: `chatcmpl-${Date.now()}`,
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model: 'claude-code',
+        choices: [{ index: 0, delta: { role: 'assistant', content: response }, finish_reason: null }]
+      };
+      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+      res.write(`data: ${JSON.stringify({ ...chunk, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+    } else {
+      const resultObj = {
+        id: `chatcmpl-${Date.now()}`,
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model: 'claude-code',
+        choices: [{ index: 0, message: { role: 'assistant', content: response }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 }
+      };
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(resultObj));
+    }
+    return;
+  }
+
   const mentionedSkill = findMentionedSkill(lastUserText, skills);
 
   // Determine request type and build appropriate prompt
