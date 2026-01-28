@@ -55,6 +55,19 @@ function extractPersona(messages) {
   return sections.length > 0 ? sections.join('\n\n') : null;
 }
 
+// Detect if message is an orchestrator notification (not a user request)
+function isOrchestratorNotification(text) {
+  // Cron events from master-monitor
+  if (text.includes('[cron:') && text.includes('OrchestratorMonitor')) {
+    return true;
+  }
+  // Approval notifications
+  if (text.includes('needs approval') && text.includes('Reply with:')) {
+    return true;
+  }
+  return false;
+}
+
 // Detect if request is conversational vs coding task
 function isConversationalRequest(text) {
   // Strip platform prefixes first (WhatsApp, Telegram, etc.)
@@ -395,10 +408,24 @@ async function handleChatCompletions(req, res) {
   const mentionedSkill = findMentionedSkill(lastUserText, skills);
 
   // Determine request type and build appropriate prompt
+  const isNotification = isOrchestratorNotification(lastUserText);
   const isConversational = isConversationalRequest(lastUserText);
   let useTools = true;
 
-  if (mentionedSkill) {
+  if (isNotification) {
+    // Orchestrator notification - DO NOT execute, just inform user
+    console.log(`[${new Date().toISOString()}] Orchestrator notification detected - passing through`);
+    useTools = false;
+    prompt = `${persona || ''}
+
+---
+
+This is a NOTIFICATION from the orchestrator system. DO NOT take any action or approve anything.
+Just inform the user about this notification in a friendly way. Let them know they need to respond if action is required.
+
+Notification:
+${lastUserText}`;
+  } else if (mentionedSkill) {
     // Skill request - inject skill instructions
     console.log(`[${new Date().toISOString()}] Skill detected: ${mentionedSkill.name} at ${mentionedSkill.location}`);
     const skillContent = readSkillFile(mentionedSkill.location);
@@ -432,7 +459,7 @@ User: ${prompt}`;
     prompt = EXECUTOR_PREFIX + prompt;
   }
 
-  console.log(`[${new Date().toISOString()}] Mode: ${mentionedSkill ? 'skill' : isConversational ? 'conversational' : 'coding'}`);
+  console.log(`[${new Date().toISOString()}] Mode: ${isNotification ? 'notification' : mentionedSkill ? 'skill' : isConversational ? 'conversational' : 'coding'}`);
   console.log(`[${new Date().toISOString()}] Request: ${prompt.substring(0, 150)}...`);
 
   try {
