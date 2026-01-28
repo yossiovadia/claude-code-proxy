@@ -6,6 +6,9 @@ const { execSync } = require('child_process');
 const PORT = process.env.PORT || 11480;
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'sonnet';
 
+// Minimal executor prefix - keeps responses action-oriented
+const EXECUTOR_PREFIX = 'Execute this task and report what you did: ';
+
 function formatMessages(messages) {
   // Helper to extract text from content (string or array)
   const getContentText = (content) => {
@@ -20,25 +23,37 @@ function formatMessages(messages) {
     return String(content);
   };
 
-  const parts = [];
-
+  // Get just the user messages to understand the task
+  const userMessages = [];
   for (const m of messages) {
     if (m.role === 'user') {
       const text = getContentText(m.content);
-      // Skip Clawdbot's compaction messages - they confuse Claude Code
+      // Skip Clawdbot's compaction messages
       if (text.startsWith('The conversation history before this point was compacted')) {
         continue;
       }
-      parts.push(text);
-    } else if (m.role === 'assistant') {
-      const text = getContentText(m.content);
-      if (text) {
-        parts.push(`Assistant: ${text}`);
+      // Strip timestamp prefix from ClawdBot messages [WhatsApp +xxx ...]
+      const cleanText = text.replace(/^\[WhatsApp[^\]]+\]\s*/i, '').trim();
+      if (cleanText) {
+        userMessages.push(cleanText);
       }
     }
   }
 
-  return parts.join('\n\n');
+  // Use the last few user messages for context, but prioritize the most recent
+  const recentMessages = userMessages.slice(-3);
+  if (recentMessages.length === 0) {
+    return '';
+  }
+
+  // If there are multiple messages, provide brief context
+  if (recentMessages.length > 1) {
+    const context = recentMessages.slice(0, -1).join(' | ');
+    const task = recentMessages[recentMessages.length - 1];
+    return EXECUTOR_PREFIX + `Context from earlier: ${context}\n\nCurrent task: ${task}`;
+  }
+
+  return EXECUTOR_PREFIX + recentMessages[0];
 }
 
 function callClaude(prompt) {
