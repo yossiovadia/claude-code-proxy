@@ -1,688 +1,413 @@
 #!/usr/bin/env node
+// Claude Code Proxy — OpenAI-compatible API backed by Claude Code CLI
+// Supports structured tool calling: parses <tool_call> from model output
+// and returns proper OpenAI tool_calls format for OpenClaw to execute.
+// Run from terminal (not launchd) to inherit full environment.
 
 const http = require('http');
 const fs = require('fs');
-const { execSync } = require('child_process');
+const os = require('os');
+const path = require('path');
+const { execFileSync } = require('child_process');
 
 const PORT = process.env.PORT || 11480;
-const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'sonnet';
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-opus-4-6';
+const TIMEOUT_MS = 120000;
+let callCounter = 0;
 
-// Minimal executor prefix - keeps responses action-oriented
-const EXECUTOR_PREFIX = 'Execute this task and report what you did: ';
+function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
 
-// Extract workspace directory from ClawdBot's system message
-function extractWorkspace(messages) {
-  const systemMsg = messages.find(m => m.role === 'system');
-  if (!systemMsg) return null;
+// ============================================================
+// Message helpers
+// ============================================================
 
-  const content = typeof systemMsg.content === 'string'
-    ? systemMsg.content
-    : systemMsg.content?.map(p => p.text).join('\n') || '';
-
-  // Look for "Your working directory is: /path"
-  const workdirMatch = content.match(/Your working directory is:\s*(\S+)/);
-  if (workdirMatch) {
-    return workdirMatch[1].replace(/^~/, process.env.HOME);
-  }
-
-  return null;
+function getContentText(c) {
+  if (!c) return '';
+  if (typeof c === 'string') return c;
+  if (Array.isArray(c)) return c.filter(p => p.type === 'text').map(p => p.text).join('\n');
+  return String(c);
 }
 
-// Extract persona (SOUL.md, IDENTITY.md) from ClawdBot's system message
-function extractPersona(messages) {
-  const systemMsg = messages.find(m => m.role === 'system');
-  if (!systemMsg) return null;
-
-  const content = typeof systemMsg.content === 'string'
-    ? systemMsg.content
-    : systemMsg.content?.map(p => p.text).join('\n') || '';
-
-  // Extract key persona sections
-  const sections = [];
-
-  // IDENTITY.md
-  const identityMatch = content.match(/## IDENTITY\.md\n([\s\S]*?)(?=\n## [A-Z]|\n# |$)/);
-  if (identityMatch) sections.push(identityMatch[1].trim());
-
-  // SOUL.md (abbreviated - just core truths)
-  const soulMatch = content.match(/## SOUL\.md\n([\s\S]*?)(?=\n## [A-Z]|\n# |$)/);
-  if (soulMatch) {
-    // Extract just the first few paragraphs to keep it brief
-    const soulContent = soulMatch[1].trim().split('\n\n').slice(0, 3).join('\n\n');
-    sections.push(soulContent);
-  }
-
-  return sections.length > 0 ? sections.join('\n\n') : null;
+function stripPrefix(t) {
+  return t.replace(/^\[(WhatsApp|Telegram|Discord|Slack|Signal)[^\]]*\]\s*/i, '')
+    .replace(/\[message_id:[^\]]+\]\s*/gi, '').trim();
 }
 
-// Detect if message is an orchestrator notification (not a user request)
-function isOrchestratorNotification(text) {
-  // Cron events from master-monitor
-  if (text.includes('[cron:') && text.includes('OrchestratorMonitor')) {
-    return true;
-  }
-  // Approval notifications
-  if (text.includes('needs approval') && text.includes('Reply with:')) {
-    return true;
-  }
-  return false;
+function extractSystemPrompt(msgs) {
+  const s = msgs.find(m => m.role === 'system');
+  return s ? getContentText(s.content) : null;
 }
 
-// Parse approval command from user message
-// Returns { action: 'approve'|'always'|'deny', session: string } or null
-function parseApprovalCommand(text, conversationContext) {
-  const cleaned = text
-    .replace(/^\[WhatsApp[^\]]+\]\s*/i, '')
-    .replace(/^\[Telegram[^\]]+\]\s*/i, '')
-    .replace(/\[message_id:[^\]]+\]\s*/gi, '')
-    .trim()
-    .toLowerCase();
-
-  // Direct commands: "approve vsr-fresh", "always vsr-fresh", "deny vsr-fresh"
-  const directMatch = cleaned.match(/^(approve|always|deny)\s+([a-z0-9_-]+)\s*$/i);
-  if (directMatch) {
-    return { action: directMatch[1], session: directMatch[2] };
-  }
-
-  // Short approvals: "approve", "approved", "yes", "sure", "ok", "1"
-  // Need to find session from context (recent notification)
-  const shortApprovalPatterns = [
-    /^(approve|approved|yes|yeah|yep|sure|ok|okay|1|go ahead|do it|allow)\.?$/i,
-    /^(approve|approved)\.?$/i,
-  ];
-
-  for (const pattern of shortApprovalPatterns) {
-    if (pattern.test(cleaned)) {
-      // Look for session in conversation context
-      const session = findSessionInContext(conversationContext);
-      if (session) {
-        return { action: 'approve', session };
-      }
-    }
-  }
-
-  // "always" short form
-  if (/^(always|always allow|trust it)\.?$/i.test(cleaned)) {
-    const session = findSessionInContext(conversationContext);
-    if (session) {
-      return { action: 'always', session };
-    }
-  }
-
-  // "deny" short form
-  if (/^(deny|no|nope|reject|block)\.?$/i.test(cleaned)) {
-    const session = findSessionInContext(conversationContext);
-    if (session) {
-      return { action: 'deny', session };
-    }
-  }
-
-  return null;
-}
-
-// Find session name from recent conversation (notifications mention sessions)
-function findSessionInContext(messages) {
-  // Look backwards through messages for session mentions
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    const content = typeof msg.content === 'string'
-      ? msg.content
-      : msg.content?.map(p => p.text).join('\n') || '';
-
-    // Pattern: "Session 'xxx' needs approval" or "approve xxx"
-    const sessionMatch = content.match(/Session ['"]?([a-z0-9_-]+)['"]?\s+needs approval/i) ||
-                         content.match(/approve\s+([a-z0-9_-]+)/i) ||
-                         content.match(/session[:\s]+([a-z0-9_-]+)/i);
-    if (sessionMatch) {
-      return sessionMatch[1];
-    }
-  }
-  return null;
-}
-
-// Execute approval command
-function executeApproval(action, session) {
-  const scriptPath = `${process.env.HOME}/code/claude-code-wingman/lib/handle-approval.sh`;
-  try {
-    const result = execSync(`${scriptPath} ${action} ${session}`, {
-      encoding: 'utf8',
-      timeout: 10000
-    });
-    console.log(`[${new Date().toISOString()}] Approval executed: ${action} ${session}`);
-    return result.trim() || `✓ Session '${session}' ${action === 'approve' ? 'approved (once)' : action === 'always' ? 'approved (always)' : 'denied'}`;
-  } catch (err) {
-    console.error(`[${new Date().toISOString()}] Approval failed:`, err.message);
-    return `Failed to ${action} session '${session}': ${err.message}`;
-  }
-}
-
-// Detect if request is conversational vs coding task
-function isConversationalRequest(text) {
-  // Strip platform prefixes first (WhatsApp, Telegram, etc.)
-  let cleaned = text
-    .replace(/^\[WhatsApp[^\]]+\]\s*/i, '')
-    .replace(/^\[Telegram[^\]]+\]\s*/i, '')
-    .replace(/^\[Discord[^\]]+\]\s*/i, '')
-    .replace(/^\[Slack[^\]]+\]\s*/i, '')
-    .replace(/^\[Signal[^\]]+\]\s*/i, '')
-    .replace(/\[message_id:[^\]]+\]\s*/gi, '')
-    .trim();
-
-  const lower = cleaned.toLowerCase().trim();
-
-  // Coding indicators
-  const codingPatterns = [
-    /\b(fix|implement|create|write|edit|refactor|debug|test|deploy|build|run|execute|compile|install)\b/,
-    /\b(function|class|method|variable|file|code|script|program|api|endpoint|database|server)\b/,
-    /\b(bug|error|issue|pr|pull request|commit|branch|merge|git)\b/,
-    /\buse\s+\w+\s+skill\b/,
-  ];
-
-  for (const pattern of codingPatterns) {
-    if (pattern.test(lower)) return false;
-  }
-
-  // Conversational indicators
-  const conversationalPatterns = [
-    /^(hi|hello|hey|what's up|how are you)/,
-    /^(what is|what are|what's|who is|who are|where is|why|how does|can you explain)/,
-    /\?$/,  // Questions
-    /^(tell me|explain|describe|summarize)/,
-    /^(thanks|thank you|ok|okay|great|cool|nice)/,
-  ];
-
-  for (const pattern of conversationalPatterns) {
-    if (pattern.test(lower)) return true;
-  }
-
-  // Short messages are often conversational
-  if (lower.length < 50 && !lower.includes('file') && !lower.includes('code')) {
-    return true;
-  }
-
-  return false;
-}
-
-// Extract available skills from ClawdBot's system message
-function extractSkills(messages) {
-  const systemMsg = messages.find(m => m.role === 'system');
-  if (!systemMsg) return [];
-
-  const content = typeof systemMsg.content === 'string'
-    ? systemMsg.content
-    : systemMsg.content?.map(p => p.text).join('\n') || '';
-
+function extractSkills(systemPrompt) {
+  if (!systemPrompt) return [];
   const skills = [];
-  const skillRegex = /<skill>\s*<name>([^<]+)<\/name>\s*<description>([^<]+)<\/description>\s*<location>([^<]+)<\/location>\s*<\/skill>/g;
-
-  let match;
-  while ((match = skillRegex.exec(content)) !== null) {
-    skills.push({
-      name: match[1].trim(),
-      description: match[2].trim(),
-      location: match[3].trim()
-    });
+  const re = /<skill>\s*<name>([^<]+)<\/name>\s*<description>([^<]+)<\/description>\s*<location>([^<]+)<\/location>\s*<\/skill>/g;
+  let m;
+  while ((m = re.exec(systemPrompt)) !== null) {
+    skills.push({ name: m[1].trim(), description: m[2].trim(), location: m[3].trim() });
   }
-
   return skills;
 }
 
-// Check if user message mentions a skill and return the skill info
-function findMentionedSkill(userMessage, skills) {
-  const lower = userMessage.toLowerCase();
+// Format full conversation (all messages, system prompt handled separately)
+function formatConversation(msgs) {
+  const parts = [];
+  for (const m of msgs) {
+    if (m.role === 'system') continue;
+    const t = getContentText(m.content);
+    if (!t || t.startsWith('The conversation history before this point was compacted')) continue;
 
-  // Build list of skill name variants for matching
-  const skillVariantsMap = new Map();
-  for (const skill of skills) {
-    const variants = [
-      skill.name.toLowerCase(),
-      skill.name.replace(/-/g, '').toLowerCase(),
-      skill.name.replace('claude-code-', '').toLowerCase(),
-      skill.name.replace(/-/g, ' ').toLowerCase()
-    ];
-    for (const v of variants) {
-      skillVariantsMap.set(v, skill);
+    if (m.role === 'user') {
+      parts.push(`User: ${stripPrefix(t)}`);
+    } else if (m.role === 'assistant') {
+      const truncated = t.length > 2000 ? t.substring(0, 2000) + '\n[...]' : t;
+      parts.push(`Assistant: ${truncated}`);
+    } else if (m.role === 'tool') {
+      // Tool results from OpenClaw — include them so the model sees execution output
+      const toolId = m.tool_call_id || 'unknown';
+      parts.push(`Tool result (${toolId}): ${t}`);
     }
   }
+  return parts.join('\n\n');
+}
 
-  // Pattern 1: "use X skill" or "X skill to"
-  const useSkillMatch = lower.match(/use\s+(\w+(?:-\w+)*)\s+skill/i) ||
-                        lower.match(/(\w+(?:-\w+)*)\s+skill\s+to/i);
+// ============================================================
+// Tool schema formatting — convert OpenAI tool defs to prompt text
+// ============================================================
 
-  if (useSkillMatch) {
-    const requestedSkill = useSkillMatch[1].toLowerCase();
-    console.log(`[${new Date().toISOString()}] Looking for skill (pattern 1): "${requestedSkill}"`);
+function formatToolsForPrompt(tools) {
+  if (!tools || !tools.length) return '';
 
-    for (const [variant, skill] of skillVariantsMap) {
-      if (variant === requestedSkill ||
-          variant.startsWith(requestedSkill) ||
-          requestedSkill.startsWith(variant.substring(0, 4))) {
-        return skill;
+  const lines = [
+    '',
+    '## Available Tools',
+    'When you want to use a tool, output EXACTLY this format (you may include text before/after):',
+    '<tool_call>',
+    '{"name": "tool_name", "arguments": {"param1": "value1"}}',
+    '</tool_call>',
+    '',
+    'You can make multiple tool calls in one response. Each must be in its own <tool_call> block.',
+    'IMPORTANT: Only use tools listed below. Output the tool call, then STOP — wait for the result before continuing.',
+    '',
+  ];
+
+  for (const tool of tools) {
+    const fn = tool.function || tool;
+    const name = fn.name;
+    const desc = fn.description || '';
+    const params = fn.parameters?.properties || {};
+    const required = fn.parameters?.required || [];
+
+    const paramList = Object.entries(params).map(([k, v]) => {
+      const req = required.includes(k) ? ' (required)' : '';
+      const type = v.type || 'any';
+      const pdesc = v.description ? ` — ${v.description}` : '';
+      return `    ${k}: ${type}${req}${pdesc}`;
+    }).join('\n');
+
+    lines.push(`### ${name}`);
+    if (desc) lines.push(desc);
+    if (paramList) lines.push(`Parameters:\n${paramList}`);
+    lines.push('');
+  }
+
+  return lines.join('\n');
+}
+
+// ============================================================
+// Tool call parsing — extract <tool_call> blocks from model output
+// ============================================================
+
+function parseToolCalls(text) {
+  const toolCalls = [];
+  const re = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
+  let match;
+
+  while ((match = re.exec(text)) !== null) {
+    try {
+      const parsed = JSON.parse(match[1].trim());
+      if (parsed.name) {
+        toolCalls.push({
+          id: `call_${++callCounter}`,
+          type: 'function',
+          function: {
+            name: parsed.name,
+            arguments: JSON.stringify(parsed.arguments || {})
+          }
+        });
       }
+    } catch (e) {
+      log(`Failed to parse tool_call: ${match[1].substring(0, 100)}`);
     }
   }
 
-  // Pattern 2: "use [known-skill-name] to" without the word "skill"
-  // Check if any known skill name appears after "use" and before "to"
-  const useToMatch = lower.match(/use\s+(\w+(?:-\w+)*)\s+to\b/i);
-  if (useToMatch) {
-    const potentialSkill = useToMatch[1].toLowerCase();
-    console.log(`[${new Date().toISOString()}] Looking for skill (pattern 2): "${potentialSkill}"`);
+  // Extract text content (everything outside <tool_call> blocks)
+  const contentText = text.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '').trim();
 
-    for (const [variant, skill] of skillVariantsMap) {
-      if (variant === potentialSkill ||
-          variant.startsWith(potentialSkill) ||
-          potentialSkill.startsWith(variant.substring(0, 4))) {
-        return skill;
-      }
-    }
+  return { toolCalls, contentText };
+}
+
+// ============================================================
+// Approval handling
+// ============================================================
+
+function parseApproval(text, ctx) {
+  const c = stripPrefix(text).toLowerCase();
+  const direct = c.match(/^(approve|always|deny)\s+([a-z0-9_-]+)\s*$/i);
+  if (direct) return { action: direct[1], session: direct[2] };
+  if (/^(approve|approved|yes|yeah|yep|sure|ok|okay|1|go ahead|do it|allow)\.?$/i.test(c)) {
+    const s = findSession(ctx); if (s) return { action: 'approve', session: s };
   }
-
+  if (/^(always|always allow|trust it)\.?$/i.test(c)) {
+    const s = findSession(ctx); if (s) return { action: 'always', session: s };
+  }
+  if (/^(deny|no|nope|reject|block)\.?$/i.test(c)) {
+    const s = findSession(ctx); if (s) return { action: 'deny', session: s };
+  }
   return null;
 }
 
-// Read a skill's SKILL.md file and expand path variables
-function readSkillFile(location) {
+function findSession(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = getContentText(messages[i].content).match(/Session ['"]?([a-z0-9_-]+)['"]?\s+needs approval/i);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+function runApproval(action, session) {
   try {
-    // Handle ~ in path
-    const expandedPath = location.replace(/^~/, process.env.HOME);
-    let content = fs.readFileSync(expandedPath, 'utf8');
-
-    // Derive SKILL_ROOT from the file path
-    // If path is /path/to/skill/clawdbot-skill/SKILL.md, root is /path/to/skill
-    let skillRoot = expandedPath;
-    if (skillRoot.endsWith('/SKILL.md')) {
-      skillRoot = skillRoot.slice(0, -'/SKILL.md'.length);
-    }
-    if (skillRoot.endsWith('/clawdbot-skill')) {
-      skillRoot = skillRoot.slice(0, -'/clawdbot-skill'.length);
-    }
-
-    // Replace <SKILL_ROOT> placeholder with actual path
-    content = content.replace(/<SKILL_ROOT>/g, skillRoot);
-    console.log(`[${new Date().toISOString()}] SKILL_ROOT resolved to: ${skillRoot}`);
-
-    return content;
-  } catch (err) {
-    console.error(`[${new Date().toISOString()}] Failed to read skill file: ${location}`, err.message);
-    return null;
-  }
+    return execFileSync(`${process.env.HOME}/code/claude-code-wingman/lib/handle-approval.sh`,
+      [action, session], { encoding: 'utf8', timeout: 10000 }).trim() || `${action}ed`;
+  } catch (e) { return `Failed: ${e.message}`; }
 }
 
-// Helper to extract text from content (string or array)
-function getContentText(content) {
-  if (content === null || content === undefined) return '';
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) {
-    return content
-      .filter(part => part.type === 'text')
-      .map(part => part.text)
-      .join('\n');
-  }
-  return String(content);
-}
+// ============================================================
+// Skill handling
+// ============================================================
 
-// Strip platform prefixes from messages
-function stripPlatformPrefix(text) {
-  return text
-    .replace(/^\[WhatsApp[^\]]+\]\s*/i, '')
-    .replace(/^\[Telegram[^\]]+\]\s*/i, '')
-    .replace(/^\[Discord[^\]]+\]\s*/i, '')
-    .replace(/^\[Slack[^\]]+\]\s*/i, '')
-    .replace(/\[message_id:[^\]]+\]\s*/gi, '')
-    .trim();
-}
-
-function formatMessages(messages, useExecutorPrefix = false) {
-  // Build conversation history (last few exchanges)
-  const exchanges = [];
-  for (const m of messages) {
-    if (m.role === 'user' || m.role === 'assistant') {
-      const text = getContentText(m.content);
-      // Skip compaction messages
-      if (text.startsWith('The conversation history before this point was compacted')) {
-        continue;
-      }
-      const cleanText = m.role === 'user' ? stripPlatformPrefix(text) : text;
-      if (cleanText) {
-        exchanges.push({ role: m.role, text: cleanText });
-      }
+function findSkill(text, skills) {
+  const lower = text.toLowerCase();
+  const variants = new Map();
+  for (const skill of skills) {
+    for (const v of [skill.name.toLowerCase(), skill.name.replace(/-/g, '').toLowerCase(),
+      skill.name.replace('claude-code-', '').toLowerCase(), skill.name.replace(/-/g, ' ').toLowerCase()]) {
+      variants.set(v, skill);
     }
   }
-
-  if (exchanges.length === 0) {
-    return '';
+  const m = lower.match(/use\s+(\w+(?:-\w+)*)\s+skill/i) ||
+            lower.match(/(\w+(?:-\w+)*)\s+skill\s+to/i) ||
+            lower.match(/use\s+(\w+(?:-\w+)*)\s+to\b/i);
+  if (m) {
+    const req = m[1].toLowerCase();
+    for (const [v, skill] of variants) {
+      if (v === req || v.startsWith(req) || req.startsWith(v.substring(0, 4))) return skill;
+    }
   }
-
-  // Get the current question (last user message)
-  const lastUserIdx = exchanges.map(e => e.role).lastIndexOf('user');
-  if (lastUserIdx === -1) return '';
-
-  const currentQuestion = exchanges[lastUserIdx].text;
-  const prefix = useExecutorPrefix ? EXECUTOR_PREFIX : '';
-
-  // If only one message, just return it
-  if (exchanges.length <= 1) {
-    return prefix + currentQuestion;
-  }
-
-  // Build context from previous exchanges (limit to last 3 exchanges before current)
-  const contextExchanges = exchanges.slice(Math.max(0, lastUserIdx - 4), lastUserIdx);
-
-  if (contextExchanges.length === 0) {
-    return prefix + currentQuestion;
-  }
-
-  // Format context concisely
-  const contextLines = contextExchanges.map(e => {
-    const label = e.role === 'user' ? 'User' : 'Assistant';
-    // Truncate long messages in context
-    const text = e.text.length > 300 ? e.text.substring(0, 300) + '...' : e.text;
-    return `${label}: ${text}`;
-  });
-
-  console.log(`[${new Date().toISOString()}] Including ${contextExchanges.length} context exchanges`);
-
-  // Frame context so Claude knows to use it only if relevant
-  return `${prefix}[Recent conversation for context - use only if relevant to the current question]
-${contextLines.join('\n')}
-
-[Current question - answer this directly]
-${currentQuestion}`;
+  return null;
 }
 
-function callClaude(prompt, options = {}) {
-  const { workspace, useTools = true } = options;
+function readSkill(location) {
+  try {
+    const p = location.replace(/^~/, process.env.HOME);
+    let content = fs.readFileSync(p, 'utf8');
+    let root = p.replace(/\/SKILL\.md$/, '').replace(/\/clawdbot-skill$/, '');
+    return content.replace(/<SKILL_ROOT>/g, root);
+  } catch { return null; }
+}
 
-  // Escape single quotes in prompt
-  const escaped = prompt.replace(/'/g, "'\\''");
+// ============================================================
+// Core: call Claude CLI
+// ============================================================
 
-  // Build command - disable tools for conversational requests
-  const toolsFlag = useTools ? '--tools default' : '';
-  const cmd = `claude -p '${escaped}' ${toolsFlag} --output-format json --dangerously-skip-permissions --model ${CLAUDE_MODEL}`;
+function callClaude(prompt, systemPrompt) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-proxy-'));
 
-  // Determine working directory
-  const cwd = workspace || process.env.HOME;
+  const args = ['-p', prompt, '--output-format', 'json', '--model', CLAUDE_MODEL,
+    '--no-session-persistence', '--tools', '', '--effort', 'high'];
 
-  console.log(`[${new Date().toISOString()}] Running from: ${cwd}`);
-  console.log(`[${new Date().toISOString()}] Tools: ${useTools ? 'enabled' : 'disabled'}`);
-  console.log(`[${new Date().toISOString()}] Running: claude -p '${prompt.substring(0, 50)}...'`);
+  // --system-prompt replaces Claude Code's default coding persona entirely
+  if (systemPrompt) {
+    args.push('--system-prompt', systemPrompt);
+  }
+
+  log(`claude | ${CLAUDE_MODEL} | ${path.basename(tmpDir)} | prompt=${prompt.length}c | sys=${systemPrompt ? systemPrompt.length + 'c' : 'none'}`);
 
   try {
-    const output = execSync(cmd, {
-      cwd,
-      encoding: 'utf8',
-      timeout: 300000, // 5 min timeout for tool use
-      maxBuffer: 10 * 1024 * 1024 // 10MB
+    const out = execFileSync('claude', args, {
+      cwd: tmpDir, encoding: 'utf8', timeout: TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024
     });
-
-    // Parse JSON output and extract result
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
     try {
-      const json = JSON.parse(output.trim());
-      if (json.result) {
-        console.log(`[${new Date().toISOString()}] Turns: ${json.num_turns}, Cost: $${json.total_cost_usd?.toFixed(4) || '0'}`);
-        return json.result;
+      const j = JSON.parse(out.trim());
+      if (j.result !== undefined && j.result !== null) {
+        const r = j.result || '(no output)';
+        log(`OK (${j.num_turns || '?'}t $${j.total_cost_usd?.toFixed(4) || 0}): ${r.substring(0, 80)}`);
+        return r;
       }
-      // Fallback if no result field
-      return json.error || output.trim();
-    } catch (parseErr) {
-      // If not JSON, return raw output
-      return output.trim();
-    }
+      return j.error || '(unexpected response format)';
+    } catch { return out.trim(); }
   } catch (err) {
-    if (err.killed) {
-      throw new Error('Claude timed out after 5 minutes');
-    }
-    throw new Error(`Claude failed: ${err.message.substring(0, 200)}`);
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    const stderr = (err.stderr || '').trim();
+    if (stderr) log(`stderr: ${stderr.substring(0, 300)}`);
+    throw new Error(stderr || (err.killed ? 'Timeout' : `Exit ${err.status}`));
   }
 }
 
-async function handleChatCompletions(req, res) {
+// ============================================================
+// HTTP handler
+// ============================================================
+
+async function handleChat(req, res) {
   let body = '';
-  req.on('data', chunk => { body += chunk; });
-  await new Promise(resolve => req.on('end', resolve));
+  req.on('data', c => body += c);
+  await new Promise(r => req.on('end', r));
 
   let data;
-  try {
-    data = JSON.parse(body);
-  } catch (e) {
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Invalid JSON' }));
-    return;
+  try { data = JSON.parse(body); } catch { return send(res, 400, { error: 'Bad JSON' }); }
+  const { messages, stream, tools } = data;
+  if (!messages?.length) return send(res, 400, { error: 'No messages' });
+
+  try { fs.writeFileSync(`${__dirname}/last-request.json`, JSON.stringify(data, null, 2)); } catch {}
+
+  const systemPrompt = extractSystemPrompt(messages);
+  const skills = extractSkills(systemPrompt);
+  const lastText = (() => {
+    const u = messages.filter(m => m.role === 'user');
+    return u.length ? stripPrefix(getContentText(u[u.length - 1].content)) : '';
+  })();
+
+  log(`--- ${messages.length} msgs | ${stream ? 'stream' : 'sync'} | ${tools?.length || 0} tools | "${lastText.substring(0, 50)}" ---`);
+
+  // Approval bypass
+  const appr = parseApproval(lastText, messages);
+  if (appr) {
+    log(`Approval: ${appr.action} ${appr.session}`);
+    return sendOK(res, runApproval(appr.action, appr.session), stream);
   }
 
-  const { messages, stream, tools, tool_choice } = data;
-  // Log full request for debugging
-  fs.writeFileSync('last-request.json', JSON.stringify(data, null, 2));
-  console.log(`[${new Date().toISOString()}] Tools present: ${tools?.length || 0}, tool_choice: ${JSON.stringify(tool_choice)}`)
+  // Build conversation prompt
+  let prompt = formatConversation(messages);
 
-  if (!messages || !Array.isArray(messages)) {
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'messages array required' }));
-    return;
+  // Skill injection
+  const skill = findSkill(lastText, skills);
+  if (skill) {
+    log(`Skill: ${skill.name}`);
+    const content = readSkill(skill.location);
+    if (content) prompt += `\n\n[Skill instructions for "${skill.name}"]:\n${content}`;
   }
 
-  // Extract context from ClawdBot's system message
-  const skills = extractSkills(messages);
-  const workspace = extractWorkspace(messages);
-  const persona = extractPersona(messages);
-
-  console.log(`[${new Date().toISOString()}] Found ${skills.length} ClawdBot skills`);
-  console.log(`[${new Date().toISOString()}] Workspace: ${workspace || 'not specified'}`);
-  console.log(`[${new Date().toISOString()}] Persona: ${persona ? 'extracted' : 'not found'}`);
-
-  // Filter to only user/assistant messages, skip system and tool messages
-  const cleanMessages = messages.filter(m => m.role === 'user' || m.role === 'assistant');
-
-  // Only use executor prefix when client expects tool usage
-  const hasTools = tools && tools.length > 0;
-  let prompt = formatMessages(cleanMessages, false); // Don't use executor prefix by default
-
-  // Check if user is asking to use a ClawdBot skill
-  const lastUserMsg = cleanMessages.filter(m => m.role === 'user').pop();
-  // Extract text from content (handle both string and array formats)
-  let lastUserText = '';
-  if (lastUserMsg?.content) {
-    if (typeof lastUserMsg.content === 'string') {
-      lastUserText = lastUserMsg.content;
-    } else if (Array.isArray(lastUserMsg.content)) {
-      lastUserText = lastUserMsg.content
-        .filter(p => p.type === 'text')
-        .map(p => p.text)
-        .join('\n');
-    }
+  // Build enhanced system prompt with tool schemas and persona rules
+  let enhancedSystem = null;
+  if (systemPrompt) {
+    const toolPrompt = formatToolsForPrompt(tools);
+    enhancedSystem = [
+      'IMPORTANT RULES:',
+      '- NEVER fabricate or invent command/tool output. When a tool returns results, relay them EXACTLY.',
+      '- NEVER read files to determine your identity. Your identity is defined below.',
+      '- Follow the persona and character defined below fully — voice, mannerisms, attitude.',
+      '- When you want to use a tool, output a <tool_call> block as described in Available Tools.',
+      '- After outputting a tool call, STOP and wait for the result. Do not guess what the result will be.',
+      '',
+      systemPrompt,
+      toolPrompt
+    ].join('\n');
   }
-  console.log(`[${new Date().toISOString()}] Last user text: ${lastUserText.substring(0, 100)}...`);
-
-  // Check for approval commands first - these bypass Claude entirely
-  const approvalCmd = parseApprovalCommand(lastUserText, messages);
-  if (approvalCmd) {
-    console.log(`[${new Date().toISOString()}] Approval command detected: ${approvalCmd.action} ${approvalCmd.session}`);
-    const result = executeApproval(approvalCmd.action, approvalCmd.session);
-
-    // Return result directly without calling Claude
-    const response = result;
-    if (stream) {
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive'
-      });
-      const chunk = {
-        id: `chatcmpl-${Date.now()}`,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model: 'claude-code',
-        choices: [{ index: 0, delta: { role: 'assistant', content: response }, finish_reason: null }]
-      };
-      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-      res.write(`data: ${JSON.stringify({ ...chunk, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
-      res.write('data: [DONE]\n\n');
-      res.end();
-    } else {
-      const resultObj = {
-        id: `chatcmpl-${Date.now()}`,
-        object: 'chat.completion',
-        created: Math.floor(Date.now() / 1000),
-        model: 'claude-code',
-        choices: [{ index: 0, message: { role: 'assistant', content: response }, finish_reason: 'stop' }],
-        usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 }
-      };
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(resultObj));
-    }
-    return;
-  }
-
-  const mentionedSkill = findMentionedSkill(lastUserText, skills);
-
-  // Determine request type and build appropriate prompt
-  const isNotification = isOrchestratorNotification(lastUserText);
-  const isConversational = isConversationalRequest(lastUserText);
-  let useTools = true;
-
-  if (isNotification) {
-    // Orchestrator notification - DO NOT execute, just inform user
-    console.log(`[${new Date().toISOString()}] Orchestrator notification detected - passing through`);
-    useTools = false;
-    prompt = `${persona || ''}
-
----
-
-This is a NOTIFICATION from the orchestrator system. DO NOT take any action or approve anything yourself.
-
-IMPORTANT: Tell the user EXACTLY what is being requested. Include:
-- The session name
-- The SPECIFIC command or action (e.g., the exact URL, file path, or bash command)
-- Copy the exact details from the notification - don't summarize vaguely like "some content"
-
-Then tell them their options (approve/always/deny + session name).
-
-Notification:
-${lastUserText}`;
-  } else if (mentionedSkill) {
-    // Skill request - inject skill instructions
-    console.log(`[${new Date().toISOString()}] Skill detected: ${mentionedSkill.name} at ${mentionedSkill.location}`);
-    const skillContent = readSkillFile(mentionedSkill.location);
-    if (skillContent) {
-      prompt = `You are helping with a ClawdBot skill called "${mentionedSkill.name}".
-
-Here are the skill instructions (SKILL.md):
----
-${skillContent}
----
-
-User request: ${prompt}
-
-Follow the skill instructions above to complete this task. Use bash commands as specified in the skill.`;
-      console.log(`[${new Date().toISOString()}] Injected skill content (${skillContent.length} chars)`);
-    }
-  } else if (isConversational && persona) {
-    // Conversational request - inject persona, disable tools
-    console.log(`[${new Date().toISOString()}] Conversational request detected, injecting persona`);
-    useTools = false;
-    prompt = `${persona}
-
----
-
-Respond naturally and conversationally. You are NOT in coding mode - just be helpful and friendly.
-
-User: ${prompt}`;
-  } else if (!isConversational) {
-    // Coding request without specific skill - use executor prefix
-    console.log(`[${new Date().toISOString()}] Coding request detected`);
-    prompt = EXECUTOR_PREFIX + prompt;
-  }
-
-  console.log(`[${new Date().toISOString()}] Mode: ${isNotification ? 'notification' : mentionedSkill ? 'skill' : isConversational ? 'conversational' : 'coding'}`);
-  console.log(`[${new Date().toISOString()}] Request: ${prompt.substring(0, 150)}...`);
 
   try {
-    const response = callClaude(prompt, { workspace, useTools });
+    const result = callClaude(prompt, enhancedSystem);
 
-    if (stream) {
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive'
-      });
+    // Parse response for <tool_call> blocks
+    const { toolCalls, contentText } = parseToolCalls(result);
 
-      const chunk = {
-        id: `chatcmpl-${Date.now()}`,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model: 'claude-code',
-        choices: [{ index: 0, delta: { role: 'assistant', content: response }, finish_reason: null }]
-      };
-      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-      res.write(`data: ${JSON.stringify({ ...chunk, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
-      res.write('data: [DONE]\n\n');
-      res.end();
+    if (toolCalls.length > 0) {
+      log(`Tool calls: ${toolCalls.map(t => t.function.name).join(', ')}`);
+      sendToolCallResponse(res, contentText, toolCalls, stream);
     } else {
-      const result = {
-        id: `chatcmpl-${Date.now()}`,
-        object: 'chat.completion',
-        created: Math.floor(Date.now() / 1000),
-        model: 'claude-code',
-        choices: [{ index: 0, message: { role: 'assistant', content: response }, finish_reason: 'stop' }],
-        usage: { prompt_tokens: Math.ceil(prompt.length / 4), completion_tokens: Math.ceil(response.length / 4), total_tokens: Math.ceil((prompt.length + response.length) / 4) }
-      };
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(result));
+      sendOK(res, result, stream);
     }
-
-    console.log(`[${new Date().toISOString()}] Response: ${response.substring(0, 100)}...`);
   } catch (err) {
-    console.error(`[${new Date().toISOString()}] Error:`, err.message);
-    res.writeHead(500, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: err.message }));
+    log(`Error: ${err.message}`);
+    sendOK(res, `[Error: ${err.message}]`, stream);
   }
 }
 
-function handleModels(req, res) {
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({
-    object: 'list',
-    data: [{ id: 'claude-code', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'anthropic' }]
-  }));
+// ============================================================
+// Response formatting
+// ============================================================
+
+function sendOK(res, content, stream) {
+  if (res.writableEnded) return;
+  const id = `chatcmpl-${Date.now()}`, t = Math.floor(Date.now() / 1000);
+  if (stream) {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
+    res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created: t, model: 'claude-code', choices: [{ index: 0, delta: { role: 'assistant', content }, finish_reason: null }] })}\n\n`);
+    res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created: t, model: 'claude-code', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
+    res.write('data: [DONE]\n\n');
+    res.end();
+  } else {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ id, object: 'chat.completion', created: t, model: 'claude-code',
+      choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } }));
+  }
 }
+
+// Send response with structured tool_calls (OpenAI format)
+function sendToolCallResponse(res, content, toolCalls, stream) {
+  if (res.writableEnded) return;
+  const id = `chatcmpl-${Date.now()}`, t = Math.floor(Date.now() / 1000);
+
+  const message = {
+    role: 'assistant',
+    content: content || null,
+    tool_calls: toolCalls
+  };
+
+  if (stream) {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
+    // Send content first if any
+    if (content) {
+      res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created: t, model: 'claude-code', choices: [{ index: 0, delta: { role: 'assistant', content }, finish_reason: null }] })}\n\n`);
+    }
+    // Send each tool call
+    for (const tc of toolCalls) {
+      res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created: t, model: 'claude-code', choices: [{ index: 0, delta: { tool_calls: [tc] }, finish_reason: null }] })}\n\n`);
+    }
+    res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created: t, model: 'claude-code', choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })}\n\n`);
+    res.write('data: [DONE]\n\n');
+    res.end();
+  } else {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ id, object: 'chat.completion', created: t, model: 'claude-code',
+      choices: [{ index: 0, message, finish_reason: 'tool_calls' }],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } }));
+  }
+}
+
+function send(res, code, obj) {
+  res.writeHead(code, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(obj));
+}
+
+// ============================================================
+// Server
+// ============================================================
 
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-
   if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
-
   const url = req.url.split('?')[0];
-
-  if (url === '/v1/chat/completions' && req.method === 'POST') {
-    await handleChatCompletions(req, res);
-  } else if (url === '/v1/models' && req.method === 'GET') {
-    handleModels(req, res);
-  } else if (url === '/health' || url === '/') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', service: 'claude-code-proxy', model: CLAUDE_MODEL }));
-  } else {
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Not found' }));
-  }
+  if (url === '/v1/chat/completions' && req.method === 'POST') await handleChat(req, res);
+  else if (url === '/v1/models') send(res, 200, { object: 'list', data: [{ id: 'claude-code', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'anthropic' }] });
+  else if (url === '/health' || url === '/') send(res, 200, { status: 'ok', model: CLAUDE_MODEL });
+  else send(res, 404, { error: 'Not found' });
 });
 
 server.listen(PORT, '127.0.0.1', () => {
-  console.log(`\n🚀 Claude Code Proxy running at http://127.0.0.1:${PORT}`);
-  console.log(`📦 Using model: ${CLAUDE_MODEL}`);
-  console.log(`\nClawdbot config:\n`);
-  console.log(JSON.stringify({
-    models: {
-      providers: {
-        "claude-code": {
-          baseUrl: `http://127.0.0.1:${PORT}/v1`,
-          apiKey: "not-needed",
-          models: [{ id: "claude-code", name: "Claude Code CLI", api: "openai-completions" }]
-        }
-      }
-    }
-  }, null, 2));
-  console.log('\n');
+  log(`Claude Code Proxy | http://127.0.0.1:${PORT} | model=${CLAUDE_MODEL}`);
+  log(`Features: --system-prompt override, tool call parsing (<tool_call> → OpenAI format), --effort high`);
 });
