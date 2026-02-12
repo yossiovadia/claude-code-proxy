@@ -11,7 +11,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 
 const PORT = process.env.PORT || 11480;
-const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-opus-4-6';
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-opus-4-6[1m]';
 const TIMEOUT_MS = 120000;
 let callCounter = 0;
 
@@ -217,13 +217,30 @@ function readSkill(location) {
 }
 
 // ============================================================
+// Model resolution — map incoming model names to Claude CLI names
+// ============================================================
+
+function resolveModel(requested) {
+  if (!requested) return CLAUDE_MODEL;
+  const lower = requested.toLowerCase();
+  if (lower === 'claude-code' || lower === 'claude-code/claude-code') return CLAUDE_MODEL;
+  if (lower.includes('opus')) return 'claude-opus-4-6[1m]';
+  if (lower.includes('sonnet')) return 'sonnet';
+  if (lower.includes('haiku')) return 'haiku';
+  if (lower.startsWith('claude-')) return requested; // pass through full model names
+  log(`Unknown model "${requested}", using default ${CLAUDE_MODEL}`);
+  return CLAUDE_MODEL;
+}
+
+// ============================================================
 // Core: call Claude CLI
 // ============================================================
 
-function callClaude(prompt, systemPrompt) {
+function callClaude(prompt, systemPrompt, model) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-proxy-'));
+  const useModel = model || CLAUDE_MODEL;
 
-  const args = ['-p', prompt, '--output-format', 'json', '--model', CLAUDE_MODEL,
+  const args = ['-p', prompt, '--output-format', 'json', '--model', useModel,
     '--no-session-persistence', '--tools', '', '--effort', 'high'];
 
   // --system-prompt replaces Claude Code's default coding persona entirely
@@ -231,7 +248,7 @@ function callClaude(prompt, systemPrompt) {
     args.push('--system-prompt', systemPrompt);
   }
 
-  log(`claude | ${CLAUDE_MODEL} | ${path.basename(tmpDir)} | prompt=${prompt.length}c | sys=${systemPrompt ? systemPrompt.length + 'c' : 'none'}`);
+  log(`claude | ${useModel} | ${path.basename(tmpDir)} | prompt=${prompt.length}c | sys=${systemPrompt ? systemPrompt.length + 'c' : 'none'}`);
 
   try {
     const out = execFileSync('claude', args, {
@@ -266,8 +283,9 @@ async function handleChat(req, res) {
 
   let data;
   try { data = JSON.parse(body); } catch { return send(res, 400, { error: 'Bad JSON' }); }
-  const { messages, stream, tools } = data;
+  const { messages, stream, tools, model: requestedModel } = data;
   if (!messages?.length) return send(res, 400, { error: 'No messages' });
+  const resolvedModel = resolveModel(requestedModel);
 
   try { fs.writeFileSync(`${__dirname}/last-request.json`, JSON.stringify(data, null, 2)); } catch {}
 
@@ -278,7 +296,7 @@ async function handleChat(req, res) {
     return u.length ? stripPrefix(getContentText(u[u.length - 1].content)) : '';
   })();
 
-  log(`--- ${messages.length} msgs | ${stream ? 'stream' : 'sync'} | ${tools?.length || 0} tools | "${lastText.substring(0, 50)}" ---`);
+  log(`--- ${messages.length} msgs | ${stream ? 'stream' : 'sync'} | ${tools?.length || 0} tools | model=${resolvedModel} | "${lastText.substring(0, 50)}" ---`);
 
   // Approval bypass
   const appr = parseApproval(lastText, messages);
@@ -316,7 +334,7 @@ async function handleChat(req, res) {
   }
 
   try {
-    const result = callClaude(prompt, enhancedSystem);
+    const result = callClaude(prompt, enhancedSystem, resolvedModel);
 
     // Parse response for <tool_call> blocks
     const { toolCalls, contentText } = parseToolCalls(result);
@@ -402,7 +420,12 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
   const url = req.url.split('?')[0];
   if (url === '/v1/chat/completions' && req.method === 'POST') await handleChat(req, res);
-  else if (url === '/v1/models') send(res, 200, { object: 'list', data: [{ id: 'claude-code', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'anthropic' }] });
+  else if (url === '/v1/models') send(res, 200, { object: 'list', data: [
+    { id: 'claude-code', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'anthropic' },
+    { id: 'opus', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'anthropic' },
+    { id: 'sonnet', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'anthropic' },
+    { id: 'haiku', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'anthropic' },
+  ] });
   else if (url === '/health' || url === '/') send(res, 200, { status: 'ok', model: CLAUDE_MODEL });
   else send(res, 404, { error: 'Not found' });
 });
