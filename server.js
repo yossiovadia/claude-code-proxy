@@ -12,7 +12,7 @@ const { execFileSync } = require('child_process');
 
 const PORT = process.env.PORT || 11480;
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-opus-4-6[1m]';
-const TIMEOUT_MS = 120000;
+const TIMEOUT_MS = 300000; // 5 minutes
 let callCounter = 0;
 
 function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
@@ -148,41 +148,6 @@ function parseToolCalls(text) {
 }
 
 // ============================================================
-// Approval handling
-// ============================================================
-
-function parseApproval(text, ctx) {
-  const c = stripPrefix(text).toLowerCase();
-  const direct = c.match(/^(approve|always|deny)\s+([a-z0-9_-]+)\s*$/i);
-  if (direct) return { action: direct[1], session: direct[2] };
-  if (/^(approve|approved|yes|yeah|yep|sure|ok|okay|1|go ahead|do it|allow)\.?$/i.test(c)) {
-    const s = findSession(ctx); if (s) return { action: 'approve', session: s };
-  }
-  if (/^(always|always allow|trust it)\.?$/i.test(c)) {
-    const s = findSession(ctx); if (s) return { action: 'always', session: s };
-  }
-  if (/^(deny|no|nope|reject|block)\.?$/i.test(c)) {
-    const s = findSession(ctx); if (s) return { action: 'deny', session: s };
-  }
-  return null;
-}
-
-function findSession(messages) {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = getContentText(messages[i].content).match(/Session ['"]?([a-z0-9_-]+)['"]?\s+needs approval/i);
-    if (m) return m[1];
-  }
-  return null;
-}
-
-function runApproval(action, session) {
-  try {
-    return execFileSync(`${process.env.HOME}/code/claude-code-wingman/lib/handle-approval.sh`,
-      [action, session], { encoding: 'utf8', timeout: 10000 }).trim() || `${action}ed`;
-  } catch (e) { return `Failed: ${e.message}`; }
-}
-
-// ============================================================
 // Skill handling
 // ============================================================
 
@@ -297,13 +262,6 @@ async function handleChat(req, res) {
   })();
 
   log(`--- ${messages.length} msgs | ${stream ? 'stream' : 'sync'} | ${tools?.length || 0} tools | model=${resolvedModel} | "${lastText.substring(0, 50)}" ---`);
-
-  // Approval bypass
-  const appr = parseApproval(lastText, messages);
-  if (appr) {
-    log(`Approval: ${appr.action} ${appr.session}`);
-    return sendOK(res, runApproval(appr.action, appr.session), stream);
-  }
 
   // Build conversation prompt
   let prompt = formatConversation(messages);
